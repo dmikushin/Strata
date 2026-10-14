@@ -1104,6 +1104,23 @@ sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disa
 retention for diagnostic comparisons. Parked snapshots are not
 persisted across restarts; the session files below are.
 
+**Disk tier (opt-in, single request mode).** Where RAM cannot hold parked conversations, the server can keep them
+on disk by itself, using the session files below. With `"slot_save_path"` set, add
+`"disk_tier": {"min_tokens": 16384, "resave_growth": 16384, "max_gib": 64}` to the config. Before each request,
+under the request FIFO, the server (`serve/disk_tier.py`) saves the conversation the request leaves - when it is at
+least `min_tokens` long and has grown by `resave_growth` tokens since its last file, which bounds the SSD writes - and
+restores the saved conversation that shares the longest token prefix with the new prompt, when that beats the live
+one by `min_gain` (default 4096) tokens. That also brings a conversation back after an idle unload or a restart.
+Matching is on exact token ids, kept in a sidecar `.ids` file beside each `tier-*.bin`; files are evicted least
+recently used past `max_gib`; other files in the directory are never touched; image requests are left alone; a
+refused save or restore lets the request read its prompt as usual. Measured on an RTX 3090 with 64 GB at 256K
+context, where RAM parking of a 172K-token conversation was OOM-killed: a 176,375-token conversation is a 2.93 GB
+file, saved in 1.5 s (+0.35 GiB RAM) and restored in 2.0 s (+2.7 GiB RAM during the transfer), against 80.4 s of
+prefill. With the expert placement frozen (`--pcie-frac 0 --adapt-every 1000000`, `STRATA_IQ_MT_MIN=1`), an answer
+from a restored state equals the answer from the live state character for character; without it two greedy answers
+from the same state already differ (the adaptive tier moves experts between GPU and CPU), restored or not.
+`python3 serve/test_disk_tier.py` tests the decisions with a scripted engine.
+
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also

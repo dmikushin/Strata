@@ -1703,6 +1703,10 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        # The conversation this process will hold after the request, for the disk tier (serve/disk_tier.py): the
+        # prompt now, each generated token as it comes.  Bound to the process, so a restarted engine holds nothing.
+        # An image request's identity is not its ids alone: it is recorded as unknown.
+        self.live = None if embeddings else {"proc": self.proc, "prompt_len": len(ids), "ids": list(ids)}
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1757,7 +1761,10 @@ class StrataEngine:
                     allow = silence
                     if cancel.is_set():
                         return
-                    yield int(line[2:])
+                    token = int(line[2:])
+                    if self.live is not None:
+                        self.live["ids"].append(token)
+                    yield token
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -1784,6 +1791,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
+                    self.live = None                      # a refused request: what the engine holds is not known
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -1880,6 +1888,8 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        if action == "restore":
+            self.live = None                                # replaced by the file; the disk tier sets what it holds
         try:
             self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
             self.proc.stdin.flush()
@@ -3928,6 +3938,17 @@ class Service:
                             with self.status_lock:
                                 self.status["queued"] -= 1
                         raise
+                    # The disk tier (serve/disk_tier.py): save the conversation this request leaves, restore the one it
+                    # resumes.  Single-request mode only - it needs the FIFO, which parallel requests do not hold.
+                    if not par and emb is None and getattr(self, "disk_tier", None) is not None:
+                        with self.status_lock:
+                            st.update(busy=True, phase="switching conversations (disk tier)")
+                        try:
+                            self.disk_tier.before(self.engine, ids)
+                        except EngineDied as e:             # the file exchange ended the engine: start it again
+                            print(f"[strata] disk tier: {e}; restarting the engine, this request reads its prompt",
+                                  flush=True)
+                            self.ensure_loaded()
                     with self.status_lock:
                         if par:
                             self.status["queued"] -= 1
@@ -6514,6 +6535,18 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    # The disk tier saves and restores conversations by itself, in slot_save_path (serve/disk_tier.py).
+    tier_cfg = cfg.get("disk_tier")
+    if tier_cfg:
+        if not svc.slot_save_path:
+            raise SystemExit("[strata] \"disk_tier\" needs \"slot_save_path\": the directory its files go to")
+        if getattr(svc.engine, "batch", 0):
+            raise SystemExit("[strata] \"disk_tier\" works with one request at a time, not with \"parallel\"")
+        from serve.disk_tier import DiskTier
+        svc.disk_tier = DiskTier(svc.slot_save_path, SessionRefused, **(tier_cfg if isinstance(tier_cfg, dict) else {}))
+        t = svc.disk_tier
+        print(f"[strata] disk tier on: conversations of {t.min_tokens}+ tokens saved when left after growing "
+              f"{t.resave_growth}, at most {t.max_bytes / (1 << 30):.0f} GiB of files", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
