@@ -1967,7 +1967,7 @@ class StrataEngine:
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while), then terminate, then kill, each given 5 s. Raises EngineStuck when it still runs after all three; the model router's 30 s parent deadline must not orphan the engine."""
         if self.proc is None:
             return
         try:
@@ -1976,14 +1976,14 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=5)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             try:
-                self.proc.wait(timeout=20)
+                self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
