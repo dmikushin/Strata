@@ -34,6 +34,9 @@ import time
 import numpy as np
 
 PREFIX = "tier-"
+# The share of a saved file's tokens a conversation must have in common with it to be the same conversation.
+# What differs is the file's last reply (its reasoning is dropped from the next turn's history), a small part.
+LINEAGE = 0.9
 
 
 def common_prefix(a: np.ndarray, b: np.ndarray) -> int:
@@ -125,15 +128,25 @@ class DiskTier:
     def _save_if_grown(self, engine, live_ids: np.ndarray) -> None:
         if len(live_ids) < self.min_tokens:
             return
-        # The longest file this conversation already has: one whose every token is a prefix of it.
-        covering = None
+        # The file this conversation already has: the one sharing at least LINEAGE of its own length with it.
+        # Not an exact prefix: the file ends with the reply as generated, reasoning included, and the chat template
+        # drops the reasoning from the history, so the next turn diverges where that reply begins. On omen a
+        # 189,974-token file shared 187,800 tokens with the next prompt; requiring the whole file as a prefix found
+        # no file, and every switch wrote a new ~3 GB one (15 files, 27 GB in 15 minutes). Another conversation
+        # shares only the system prompt (9,185 tokens there): nowhere near LINEAGE of a long file.
+        covering, covered = None, 0
         for entry in self.entries.values():
-            if len(entry.ids) <= len(live_ids) and common_prefix(entry.ids, live_ids) == len(entry.ids):
-                if covering is None or len(entry.ids) > len(covering.ids):
-                    covering = entry
-        if covering is not None and len(live_ids) - len(covering.ids) < self.resave_growth:
+            shared = common_prefix(entry.ids, live_ids)
+            if shared >= self.min_tokens and shared >= LINEAGE * len(entry.ids) and shared > covered:
+                covering, covered = entry, shared
+        # Growth is what a restore of that file would read again: everything past the part they share.
+        if covering is not None and len(live_ids) - covered < self.resave_growth:
             return                              # the file is close enough: the restore reads the rest again
-        name = f"{PREFIX}{hashlib.sha1(live_ids[:self.min_tokens].tobytes()).hexdigest()[:16]}-{len(live_ids)}"
+        # Named by ALL of its tokens. A hash of the first min_tokens alone gave two conversations with the same
+        # opening and the same length one name, and the second save overwrote the first.
+        name = f"{PREFIX}{hashlib.sha1(live_ids.tobytes()).hexdigest()[:16]}-{len(live_ids)}"
+        if name in self.entries:
+            return                              # exactly this conversation is on disk already
         bin_path, ids_path = self._paths(name)
         try:
             r = engine.session_file("save", bin_path)

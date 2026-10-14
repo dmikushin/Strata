@@ -123,6 +123,42 @@ class DiskTierTest(unittest.TestCase):
         self.assertNotEqual(set(self.tier.entries), first)
         self.assertFalse(any(os.path.exists(os.path.join(self.dir, n + ".bin")) for n in first))
 
+    def test_the_next_turn_of_a_saved_conversation_is_not_written_again(self):
+        # The chat template drops the reasoning from the history, so the next prompt diverges from the saved file
+        # where the previous reply begins: on omen a 189,974-token file shared only 187,800 tokens with the next
+        # prompt. Requiring the file to be an exact prefix wrote a new ~3 GB file at every switch.
+        prompt = conv(1, 300)
+        reply_with_reasoning, visible_reply = list(range(900, 920)), list(range(950, 955))
+        self.engine.run(prompt, reply_with_reasoning)
+        self.tier.before(self.engine, conv(2, 50))          # leaves it: saved with the reasoning
+        next_turn = prompt + visible_reply + [7, 8, 9]      # what the template renders next time
+        self.engine.restart()
+        self.tier.before(self.engine, next_turn)            # restored: shares the 300-token prompt
+        self.engine.run(next_turn, list(range(960, 970)))   # grew by 8 + 10, far below resave_growth 50
+        self.tier.before(self.engine, conv(3, 50))          # leaves it again
+        self.assertEqual(len(self.saves()), 1, "the same conversation, barely grown, is not saved again")
+        self.assertEqual(len(self.tier.entries), 1)
+
+    def test_a_grown_next_turn_replaces_its_older_file(self):
+        prompt = conv(1, 300)
+        self.engine.run(prompt, list(range(900, 920)))
+        self.tier.before(self.engine, conv(2, 50))
+        first = set(self.tier.entries)
+        self.engine.run(prompt + list(range(950, 1050)))    # grew by 100 past the shared prompt >= 50
+        self.tier.before(self.engine, conv(3, 50))
+        self.assertEqual(len(self.saves()), 2)
+        self.assertEqual(len(self.tier.entries), 1, "the older file of the same conversation is removed")
+        self.assertNotEqual(set(self.tier.entries), first)
+
+    def test_another_conversation_sharing_only_the_system_prompt_is_kept(self):
+        system = conv(9, 120)                               # a shared system prompt, above min_tokens 100
+        a, b = system + conv(1, 200), system + conv(2, 200)
+        self.engine.run(a)
+        self.tier.before(self.engine, conv(5, 50))
+        self.engine.run(b)
+        self.tier.before(self.engine, conv(6, 50))
+        self.assertEqual(len(self.tier.entries), 2, "b shares 120 of a's 320 tokens: not the same conversation")
+
     def test_a_restarted_engine_gets_its_conversation_back(self):
         a = conv(1, 300)
         self.engine.run(a)
